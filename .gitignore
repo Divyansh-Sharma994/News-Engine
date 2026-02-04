@@ -1,0 +1,10 @@
+venv/
+.gemini/
+__pycache__/
+*.pyc
+.env
+*.xlsx
+*.csv
+.DS_Store
+*.log
+brain/

@@ -1,0 +1,13 @@
+streamlit
+pandas
+requests
+feedparser
+aiohttp
+beautifulsoup4
+xlsxwriter
+aiohttp-socks
+stem
+google-generativeai
+sentence-transformers
+transformers
+torch

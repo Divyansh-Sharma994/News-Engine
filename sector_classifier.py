@@ -4,11 +4,9 @@ Priority: Gemini → SBERT → Keyword Fallback
 Optimized for accuracy + speed
 """
 
-from sentence_transformers import SentenceTransformer
 import numpy as np
 import re
 
-# ==============================
 # GLOBALS (Lazy Loaded)
 # ==============================
 _sbert_model = None
@@ -18,6 +16,8 @@ _sector_embeddings = None
 def get_sbert_model():
     global _sbert_model
     if _sbert_model is None:
+        # Lazy import to avoid loading Torch at startup
+        from sentence_transformers import SentenceTransformer
         _sbert_model = SentenceTransformer("all-MiniLM-L6-v2")
     return _sbert_model
 

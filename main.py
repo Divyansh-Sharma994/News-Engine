@@ -6,11 +6,19 @@ import asyncio
 # import aiohttp # Not used directly here
 # import re # Not used directly here
 # app2.py
-from advanced_ner_extractor import extract_top_companies  # <--- ADD THIS
+from advanced_ner_extractor import extract_top_companies, load_ner_model  # <--- Updated import
 # Import our helper tools (which we wrote in other files)
 from gdelt_fetcher import fetch_gdelt_simple
 from article_scraper import enhance_articles_async
 from sector_classifier import classify_sector
+
+@st.cache_resource(show_spinner=False)
+def get_ner_pipeline():
+    """
+    Cached function to load the NER model once across the app session.
+    """
+    model, available = load_ner_model()
+    return model
 
 # --- PAGE SETUP ---
 # This configures the browser tab title and layout
@@ -59,7 +67,32 @@ if "articles" not in st.session_state:
     st.session_state.articles = []
 
 # --- INPUT SECTION (Search Bar) ---
-col1, col2 = st.columns([3, 1])
+    
+# --- INPUT SECTION (Search Bar) ---
+
+# Map friendly names to Google News codes
+REGION_MAP = {
+    "India 🇮🇳": "IN:en",
+    "USA 🇺🇸": "US:en",
+    "UK 🇬🇧": "GB:en",
+    "Australia 🇦🇺": "AU:en",
+    "Canada 🇨🇦": "CA:en",
+    "Singapore 🇸🇬": "SG:en",
+    "New Zealand 🇳🇿": "NZ:en",
+    "Ireland 🇮🇪": "IE:en",
+    "South Africa 🇿🇦": "ZA:en",
+    "Philippines 🇵🇭": "PH:en",
+    "Malaysia 🇲🇾": "MY:en",
+    "Pakistan 🇵🇰": "PK:en",
+    "Hong Kong 🇭🇰": "HK:en",
+    "UAE 🇦🇪": "AE:en",
+    "Europe 🇪🇺": "EU:en",
+    "Global 🌐": "WORLD:en"
+}
+
+# Layout: [Sector/Keyword (2)] [Region (1)] [Days (1)]
+col1, col2, col3 = st.columns([2, 1, 1])
+
 with col1:
     sector_input = st.selectbox(
         "📂 Select Sector", 
@@ -74,9 +107,38 @@ with col1:
         query = sector_input
 
 with col2:
+    # Moved from Sidebar to Main UI for visibility
+    selected_region_names = st.multiselect(
+        "🌍 Regions",
+        options=list(REGION_MAP.keys()),
+        default=["India 🇮🇳"],
+        help="Select which countries to source news from."
+    )
+    
+    # Convert names to codes
+    selected_region_codes = [REGION_MAP[name] for name in selected_region_names]
+    
+    if not selected_region_codes:
+        selected_region_codes = list(REGION_MAP.values())
+
+with col3:
     duration = st.number_input("📅 Days back", min_value=1, max_value=3650, value=7)
 
 st.markdown("---")
+
+# --- TOR CONFIGURATION ---
+with st.expander("🛡️ Advanced: Privacy & Rate Limit Bypass"):
+    st.info("Using **Tor Browser** allows the system to rotate your IP address automatically when Google blocks requests.")
+    use_tor = st.checkbox("Enable Tor Proxy (Requires Tor Browser to be open)", value=False)
+    saturation_mode = st.checkbox("🚀 Enable Saturation Mode (Target: 700+ Articles/Day)", value=False, help="Uses extreme slicing and query variations. Much slower but maximum results.")
+    
+    if use_tor:
+        st.success("✅ Tor Mode Active: System will attempt to rotate IP if rate-limited.")
+        if saturation_mode:
+            st.info("🔥 Saturation Mode + Tor: System will proactively rotate IP every 20 tasks.")
+        st.warning("⚠️ Note: Search will be slower due to Tor network multi-hop routing.")
+    else:
+        use_tor = False
 
 # --- SEARCH ACTION ---
 # This runs when you click the big red button
@@ -88,9 +150,10 @@ if st.button("🚀 Find News Articles", type="primary", use_container_width=True
         if os.path.exists("loader.jpg"):
             st.image("loader.jpg", width=250)
     with col_txt:
-        st.markdown("### We are working for you, be patient... ⏳")
+        st.markdown("### 🛡️ Resilient Deep Search Active...")
+        st.markdown("We are conducting a deep, stable search. To avoid being blocked, we are processing queries with traffic-smoothing delays. Please stay with us... ⏳")
         # Initialize Progress Bar immediately here to show 0%
-        main_progress = st.progress(0, text="0% complete")
+        main_progress = st.progress(0, text="0% complete - Initializing Omega Strategy...")
 
     # --- INTERNAL CLASSIFICATION (For Custom Keywords) ---
     if sector_input == "CUSTOM" and query:
@@ -117,14 +180,30 @@ if st.button("🚀 Find News Articles", type="primary", use_container_width=True
         
         # STEP 1: FIND LINKS
         # Fake a small progress update to show activity
-        main_progress.progress(10, text="10% complete - Searching for links...")
-        status.write(f"🔍 Searching Google News for '{query}'...")
+        main_progress.progress(10, text="10% complete - Initializing Traffic Smoothing...")
+        status.write(f"🔍 Resilient Mode: Slicing {duration} days into 4h-chunks for stable high-volume retrieval...")
         
-        # We ask for up to 5000 links
-        raw_articles = fetch_gdelt_simple(query, days=duration, max_articles=5000)
+        # Callback to update the UI during the Search Phase (10% -> 50%)
+        def search_progress_handler(completed, total):
+            pct = 10 + int((completed / total) * 40) # Scale 0-100 to 10-50
+            msg = f"{pct}% - Searching: Agent {completed}/{total} active..."
+            main_progress.progress(pct, text=msg)
+            # We can't update status.write too fast or it flickers, so we just update bar
+            
+        # We ask for up to 50000 links
+        raw_articles = fetch_gdelt_simple(
+            query, 
+            days=duration, 
+            max_articles=50000, 
+            progress_callback=search_progress_handler,
+            target_regions=selected_region_codes,
+            sector_context=sector_input if sector_input != "CUSTOM" else None,
+            use_tor=use_tor,
+            saturation_mode=saturation_mode
+        )
         
-        # Jump to 20% after finding links
-        main_progress.progress(20, text=f"20% complete - Found {len(raw_articles)} links...")
+        # Jump to 50% after finding links
+        main_progress.progress(50, text=f"50% complete - Found {len(raw_articles)} links... Processing...")
         
         if not raw_articles:
             status.update(label="❌ No news found!", state="error", expanded=False)
@@ -138,14 +217,14 @@ if st.button("🚀 Find News Articles", type="primary", use_container_width=True
             
             # This little function updates the main progress bar
             def update_progress(current, total):
-                # We map the scraping progress (0-100%) to the remaining main progress (20-100%)
+                # We map the scraping progress (0-100%) to the remaining main progress (50-100%)
                 scrape_percent = (current / total)
-                total_percent = int(20 + (scrape_percent * 80))
+                total_percent = int(50 + (scrape_percent * 50))
                 
                 main_progress.progress(total_percent, text=f"{total_percent}% complete - Reading article {current}/{total}")
                 
                 # Update text every few items inside the status box too
-                if current % 5 == 0 or current == total:
+                if current % 10 == 0 or current == total:
                      status.update(label=f"📖 Reading articles... ({int(scrape_percent*100)}%)")
             
             # RUN THE SCRAPER! (This visits all sites)
@@ -195,15 +274,21 @@ if st.session_state.articles:
             
             # 1. Run the extraction tool
             # We use the current query context to help the extractor
+            
+            # Load the model (cached)
+            ner_model = get_ner_pipeline()
+            
+
             top_companies = extract_top_companies(
                 st.session_state.articles, 
                 st.session_state.get('last_query', query),
-                top_n=5
+                top_n=5,
+                ner_model=ner_model
             )
             
             if top_companies:
-                # 2. Display Top 3 as Big Metrics
-                cols = st.columns(len(top_companies[:3]))
+                # 2. Display Top 3 as Big Metrics + Total Articles on the right
+                cols = st.columns(len(top_companies[:3]) + 1)
                 for idx, company in enumerate(top_companies[:3]):
                     with cols[idx]:
                         st.metric(
@@ -211,6 +296,15 @@ if st.session_state.articles:
                             value=f"{company['dominance_score']:.1f}", 
                             delta=f"{company['mentions']} mentions"
                         )
+                
+                # Show Total Articles in the right-most column
+                with cols[-1]:
+                    st.metric(
+                        label="📄 Total Coverage", 
+                        value=len(st.session_state.articles),
+                        delta="Total Articles Found",
+                        delta_color="normal"
+                    )
                 
                 # 3. Detailed Breakdown in an Expander
                 with st.expander(f"📉 View Full Leaderboard ({len(top_companies)} companies detected)"):

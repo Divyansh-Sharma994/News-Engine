@@ -10,18 +10,24 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # Use transformers-based NER (optional - fallback to pattern-based)
-NER_AVAILABLE = False
-ner_pipeline = None
+def load_ner_model():
+    """
+    Factory function to load the NER model safely.
+    Returns: (pipeline, available_bool)
+    """
+    try:
+        from transformers import pipeline
+        # Aggregation strategy simple merges sub-tokens (B-ORG, I-ORG) into one entity
+        model = pipeline("ner", model="dslim/bert-base-NER", aggregation_strategy="simple")
+        print("✅ Transformers NER loaded successfully")
+        return model, True
+    except Exception as e:
+        print(f"⚠️ Transformers not available, using pattern-based extraction: {e}")
+        return None, False
 
-try:
-    from transformers import pipeline
-    ner_pipeline = pipeline("ner", model="dslim/bert-base-NER", aggregation_strategy="simple")
-    NER_AVAILABLE = True
-    print("✅ Transformers NER loaded successfully")
-except Exception as e:
-    print(f"⚠️ Transformers not available, using pattern-based extraction: {e}")
-    NER_AVAILABLE = False
-    ner_pipeline = None
+# Default global state - initially None
+ner_pipeline = None
+NER_AVAILABLE = False
 
 
 class AdvancedNERExtractor:
@@ -29,8 +35,9 @@ class AdvancedNERExtractor:
     Production-grade entity extractor with strict company/organization filtering
     """
     
-    def __init__(self):
-        self.ner = ner_pipeline
+    def __init__(self, ner_instance=None):
+        # Use passed instance if available, otherwise fallback to global (which is likely None now)
+        self.ner = ner_instance if ner_instance else ner_pipeline
         
         # STRICT: Publishers and news outlets to exclude
         self.excluded_publishers = {
@@ -323,7 +330,7 @@ class AdvancedNERExtractor:
         return ranked
 
 
-def extract_top_companies(articles: List[Dict], query: str, top_n: int = 10) -> List[Dict]:
+def extract_top_companies(articles: List[Dict], query: str, top_n: int = 10, ner_model=None) -> List[Dict]:
     """
     Main function: Extract top trending companies/organizations
     
@@ -331,6 +338,7 @@ def extract_top_companies(articles: List[Dict], query: str, top_n: int = 10) -> 
         articles: List of article dictionaries with 'title', 'source'
         query: Search query (for context)
         top_n: Number of top entities to return
+        ner_model: Optional pre-loaded NER pipeline
     
     Returns:
         List of top N companies ranked by dominance
@@ -338,7 +346,7 @@ def extract_top_companies(articles: List[Dict], query: str, top_n: int = 10) -> 
     if not articles:
         return []
     
-    extractor = AdvancedNERExtractor()
+    extractor = AdvancedNERExtractor(ner_instance=ner_model)
     
     # Step 1: Extract entities with NER
     entity_data = extractor.extract_entities_ner(articles)
