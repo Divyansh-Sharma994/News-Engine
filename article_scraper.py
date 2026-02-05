@@ -223,7 +223,16 @@ async def enhance_articles_async(articles, limit=None, progress_callback=None):
     Process articles to get full content.
     This runs 'scrape_article_content_async' for MANY articles at once.
     """
-    targets = articles[:limit] if limit else articles
+    # Deduplicate links before processing
+    unique_targets = []
+    seen_links = set()
+    for article in (articles[:limit] if limit else articles):
+        link = article.get('link')
+        if link and link not in seen_links:
+            seen_links.add(link)
+            unique_targets.append(article)
+    
+    targets = unique_targets
     total = len(targets)
     completed = 0
     

@@ -164,33 +164,25 @@ def fetch_gdelt_simple(keyword: str, days: int = 7, max_articles: int = 50000, p
                 f"{base_query}%20report"
             ]
         
-        # 2. SMART EXPANSION (If a sector is provided)
-        # If the user selected "Finance", we also search "stocks", "banking", etc.
-        if sector_context and sector_context in SECTOR_TOPICS:
-            related_topics = SECTOR_TOPICS[sector_context]
-            print(f"🧠 Smart Expansion Active for '{sector_context}': Adding {len(related_topics)} related topics...")
+        # 2. SMART EXPANSION (If a sector is provided or detected)
+        # Check if we should use sector_context
+        # If sector_input was "CUSTOM", main.py might have classified it already
+        effective_sector = sector_context
+        
+        if effective_sector and effective_sector in SECTOR_TOPICS:
+            related_topics = SECTOR_TOPICS[effective_sector]
+            print(f"🧠 Smart Expansion Active for '{effective_sector}': Adding {len(related_topics)} related topics...")
             
             for topic in related_topics:
-                # We combine the Base Keyword with the Topic for relevance
-                # e.g. "Adani" + "Stocks", "Adani" + "Port"
-                # BUT if Query is just the Sector Name (e.g. Query="Finance"), we just search the sub-topic
-                
-                if keyword.lower() == sector_context.lower():
-                    # Generic Sector Search: Just search the topic directly
-                    # e.g. Query="Finance" -> Search "Banking", "Stocks"
-                    safe_topic = requests.utils.quote(topic)
+                safe_topic = requests.utils.quote(topic)
+                if keyword.lower() == effective_sector.lower():
                     queries.append(safe_topic)
                 else:
-                    # Specific Company/Entity Search: Combine them
-                    # e.g. Query="Nvidia" -> Search "Nvidia stocks", "Nvidia chips"
-                    safe_topic = requests.utils.quote(topic)
                     queries.append(f"{base_query}%20{safe_topic}")
         
-        # Use the regions requested by the user
-        regions = target_regions
-        
         # BALANCED CONCURRENCY for Resilience
-        semaphore = asyncio.Semaphore(5)
+        # Increased from 5 to 10 for better speed while maintaining stability
+        semaphore = asyncio.Semaphore(10)
         
         # OMEGA TOR CONNECTOR
         connector = None
@@ -198,33 +190,34 @@ def fetch_gdelt_simple(keyword: str, days: int = 7, max_articles: int = 50000, p
             print("🛡️ Tor Mode: Routing through 127.0.0.1:9150")
             connector = ProxyConnector.from_url("socks5://127.0.0.1:9150")
         
-        # 3. BALANCED TIME SLICING
-        # Saturation mode: 2-hour chunks (12/day)
-        # Normal mode: 4-hour chunks (6/day)
-        hour_step = 2 if saturation_mode else 4
-        
-        expanded_queries = queries 
-        
         urls = []
         for i in range(days):
-            date_obj = datetime.now() - timedelta(days=i)
-            date_str = date_obj.strftime("%Y-%m-%d")
+            date_start = datetime.now() - timedelta(days=i+1)
+            date_end = datetime.now() - timedelta(days=i)
             
-            # We slice the day into 4-hour chunks (6 per day)
-            for h in range(0, 24, 4):
-                # Google News RSS supports 'after'/'before' which allows some day-level variety
-                # By creating unique URLs for different chunks, we ensure we don't hit the 100-limit per URL
-                time_filter = f"%20after%3A{date_str}" 
-                
-                for q in expanded_queries:
-                    for region in target_regions:
-                        hl = "en-" + region.split(':')[0]
-                        gl = region.split(':')[0]
-                        ceid = region
-                        
-                        # Add a fake 'chunk' identifier to differentiate URLs
-                        url = f"https://news.google.com/rss/search?q={q}{time_filter}&hl={hl}&gl={gl}&ceid={ceid}&chunk={h}"
-                        urls.append(url)
+            # Format dates for Google News (after:YYYY-MM-DD before:YYYY-MM-DD)
+            # This ensures each chunk looks at a unique window
+            start_str = date_start.strftime("%Y-%m-%d")
+            end_str = date_end.strftime("%Y-%m-%d")
+            
+            # We slice the day into chunks. 
+            # Google News doesn't support hour-level 'before/after' in RSS, 
+            # but we can use different regional parameters or permutations to maximize coverage.
+            time_filter = f"%20after%3A{start_str}%20before%3A{end_str}"
+            
+            for q in queries:
+                for region in target_regions:
+                    hl = "en-" + region.split(':')[0]
+                    gl = region.split(':')[0]
+                    ceid = region
+                    
+                    # We keep 'chunk' as a parameter to differentiate cache-busting if any, 
+                    # but the primary fix is the inclusion of the 'before' filter.
+                    url = f"https://news.google.com/rss/search?q={q}{time_filter}&hl={hl}&gl={gl}&ceid={ceid}"
+                    urls.append(url)
+        
+        # Deduplicate URLs just in case
+        urls = list(dict.fromkeys(urls))
         
         # Stats for progress
         total_tasks = len(urls)
@@ -233,16 +226,8 @@ def fetch_gdelt_simple(keyword: str, days: int = 7, max_articles: int = 50000, p
         async def fetch_with_semaphore(url):
             nonlocal completed_tasks
             async with semaphore:
-                # Proactive Tor Rotation in Saturation Mode
-                # Change IP every 15-20 requests to stay fresh
-                if use_tor and saturation_mode and completed_tasks > 0 and completed_tasks % 20 == 0:
-                    print(f"🔄 Saturation Mode: Proactive IP Rotation at {completed_tasks} tasks...")
-                    renew_tor_identity()
-                    # Extra sleep to let Tor stabilize
-                    await asyncio.sleep(3)
-
                 # MANDATORY JITTERED DELAY
-                await asyncio.sleep(random.uniform(1.0, 3.5))
+                await asyncio.sleep(random.uniform(0.5, 2.0)) # Slightly faster jitter
                 
                 results = await fetch_rss_async(url, connector=connector)
                 
@@ -255,13 +240,17 @@ def fetch_gdelt_simple(keyword: str, days: int = 7, max_articles: int = 50000, p
                 
                 return results
 
-        print(f"📡 Launching Resilient Search with {len(urls)} agents (Traffic Smoothing Active)...")
+        print(f"📡 Launching Resilient Search with {len(urls)} URLs (Speed Optimized)...")
         tasks = [fetch_with_semaphore(url) for url in urls]
-        results = await asyncio.gather(*tasks)
+        # Using return_exceptions=True to ensure one failure doesn't kill the whole process
+        results = await asyncio.gather(*tasks, return_exceptions=True)
         
         all_results = []
-        for res_list in results:
-            all_results.extend(res_list)
+        for res in results:
+            if isinstance(res, list):
+                all_results.extend(res)
+            elif isinstance(res, Exception):
+                print(f"⚠️ Task failed with exception: {res}")
         return all_results
     
     # START THE SEARCH!
@@ -271,25 +260,31 @@ def fetch_gdelt_simple(keyword: str, days: int = 7, max_articles: int = 50000, p
     
     # Process all the results we got back
     for entry in all_entries_lists:
-        title = entry.get('title', '')
+        title = entry.get('title', '').strip()
+        source = entry.get('source', {}).get('title', 'Unknown')
         
         # --- Deduplication ---
-        # --- Deduplication ---
-        # Robust normalization: remove special characters and whitespace to catch minor variations
-        norm_title = re.sub(r'[^a-zA-Z0-9]', '', title).lower()
+        # We use a tuple of (normalized_title, source) to catch exact same 
+        # articles from the same source while allowing the same headline 
+        # from different outlets.
+        norm_title = re.sub(r'\s+', ' ', title).lower()
+        dedup_key = (norm_title, source)
         
-        if title and norm_title not in seen_titles:
-            seen_titles.add(norm_title)
+        if title and dedup_key not in seen_titles:
+            seen_titles.add(dedup_key)
             
             # Clean description
             raw_description = entry.get('summary', '')
             soup = BeautifulSoup(raw_description, 'html.parser')
             clean_description = soup.get_text(separator=' ', strip=True)
             
+            # Remove "and more »" which Google News often appends
+            clean_description = re.sub(r'\s*and more\s*»', '', clean_description)
+            
             articles.append({
                 'title': title,
                 'description': clean_description if clean_description else 'No description',
-                'source': entry.get('source', {}).get('title', 'Unknown'),
+                'source': source,
                 'link': entry.get('link', ''),
                 'published': entry.get('published', '')
             })

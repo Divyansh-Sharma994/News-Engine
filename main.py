@@ -126,19 +126,11 @@ with col3:
 
 st.markdown("---")
 
-# --- TOR CONFIGURATION ---
-with st.expander("🛡️ Advanced: Privacy & Rate Limit Bypass"):
-    st.info("Using **Tor Browser** allows the system to rotate your IP address automatically when Google blocks requests.")
-    use_tor = st.checkbox("Enable Tor Proxy (Requires Tor Browser to be open)", value=False)
-    saturation_mode = st.checkbox("🚀 Enable Saturation Mode (Target: 700+ Articles/Day)", value=False, help="Uses extreme slicing and query variations. Much slower but maximum results.")
-    
-    if use_tor:
-        st.success("✅ Tor Mode Active: System will attempt to rotate IP if rate-limited.")
-        if saturation_mode:
-            st.info("🔥 Saturation Mode + Tor: System will proactively rotate IP every 20 tasks.")
-        st.warning("⚠️ Note: Search will be slower due to Tor network multi-hop routing.")
-    else:
-        use_tor = False
+# --- CONFIGURATION DEFAULTS ---
+use_tor = False
+saturation_mode = False
+
+# --- SEARCH ACTION ---
 
 # --- SEARCH ACTION ---
 # This runs when you click the big red button
@@ -197,7 +189,7 @@ if st.button("🚀 Find News Articles", type="primary", use_container_width=True
             max_articles=50000, 
             progress_callback=search_progress_handler,
             target_regions=selected_region_codes,
-            sector_context=sector_input if sector_input != "CUSTOM" else None,
+            sector_context=st.session_state.get('classified_sector') if sector_input == "CUSTOM" else sector_input,
             use_tor=use_tor,
             saturation_mode=saturation_mode
         )
