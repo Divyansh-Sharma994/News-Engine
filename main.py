@@ -28,8 +28,8 @@ st.set_page_config(page_title="News Intelligence", layout="wide", initial_sideba
 # We hide the default Streamlit menu to make it look like a real app.
 st.markdown("""
 <style>
-    #MainMenu {visibility: hidden;}
-    header {visibility: hidden;}
+    /* #MainMenu {visibility: hidden;} */
+    /* header {visibility: hidden;} */
     footer {visibility: hidden;}
     .stDeployButton {display: none;}
 </style>
@@ -126,14 +126,25 @@ with col3:
 
 st.markdown("---")
 
-# --- CONFIGURATION DEFAULTS ---
-use_tor = False
-saturation_mode = False
-
-# --- SEARCH ACTION ---
+# --- CONFIGURATION (Sidebar) ---
+with st.sidebar:
+    st.header("⚙️ Advanced Settings")
+    use_tor = st.toggle("🛡️ Use Tor Proxy", value=False, help="Route all search & scraping through Tor (127.0.0.1:9150) to avoid rate limits.")
+    saturation_mode = st.toggle("🔥 Saturation Mode", value=False, help="Deep search mode to hit maximum article volume (slow!)")
+    
+    if use_tor:
+        st.info("🛡️ **Tor Proxy Enabled**: IP rotation will be used if rate limits are hit.")
+        
+    max_articles_limit = st.selectbox(
+        "🔢 Max Articles", 
+        options=[10, 25, 50, 100, 200, 500, 1000, 2000, 5000],
+        index=3, # Default to 100
+        help="Limit the number of articles to scrape to save time."
+    )
 
 # --- SEARCH ACTION ---
 # This runs when you click the big red button
+st.markdown("<br>", unsafe_allow_html=True) # Spacer
 if st.button("🚀 Find News Articles", type="primary", use_container_width=True):
     # --- CUSTOM LOADER ---
     # Increased size: Ratio 2:5, Width 250
@@ -142,8 +153,8 @@ if st.button("🚀 Find News Articles", type="primary", use_container_width=True
         if os.path.exists("loader.jpg"):
             st.image("loader.jpg", width=250)
     with col_txt:
-        st.markdown("### 🛡️ Resilient Deep Search Active...")
-        st.markdown("We are conducting a deep, stable search. To avoid being blocked, we are processing queries with traffic-smoothing delays. Please stay with us... ⏳")
+        st.markdown(f"### {'🛡️' if use_tor else '🚀'} {'Tor Deep Search' if use_tor else 'Resilient Deep Search'} Active...")
+        st.markdown(f"We are conducting a deep, stable search. {'Routing through Tor for IP rotation.' if use_tor else 'Using traffic-smoothing delays.'} Please stay with us... ⏳")
         # Initialize Progress Bar immediately here to show 0%
         main_progress = st.progress(0, text="0% complete - Initializing Omega Strategy...")
 
@@ -173,7 +184,7 @@ if st.button("🚀 Find News Articles", type="primary", use_container_width=True
         # STEP 1: FIND LINKS
         # Fake a small progress update to show activity
         main_progress.progress(10, text="10% complete - Initializing Traffic Smoothing...")
-        status.write(f"🔍 Resilient Mode: Slicing {duration} days into 4h-chunks for stable high-volume retrieval...")
+        status.write(f"🔍 Mode: {'Tor Proxy' if use_tor else 'Standard'} | Slicing {duration} days for stable retrieval...")
         
         # Callback to update the UI during the Search Phase (10% -> 50%)
         def search_progress_handler(completed, total):
@@ -186,7 +197,7 @@ if st.button("🚀 Find News Articles", type="primary", use_container_width=True
         raw_articles = fetch_gdelt_simple(
             query, 
             days=duration, 
-            max_articles=50000, 
+            max_articles=max_articles_limit, 
             progress_callback=search_progress_handler,
             target_regions=selected_region_codes,
             sector_context=st.session_state.get('classified_sector') if sector_input == "CUSTOM" else sector_input,
@@ -226,8 +237,9 @@ if st.button("🚀 Find News Articles", type="primary", use_container_width=True
                 
                 enhanced_articles = asyncio.run(enhance_articles_async(
                     raw_articles, 
-                    limit=None, 
-                    progress_callback=update_progress
+                    limit=max_articles_limit, 
+                    progress_callback=update_progress,
+                    use_tor=use_tor
                 ))
                 
                 # DEBUG: Check result count
@@ -268,15 +280,25 @@ if st.session_state.articles:
             # We use the current query context to help the extractor
             
             # Load the model (cached)
+            # Load the model (cached)
             ner_model = get_ner_pipeline()
             
+            # --- PROGRESS BAR FOR ANALYSIS ---
+            analysis_progress = st.progress(0, text="Starting analysis...")
+            
+            def update_analysis_progress(current, total):
+                percent = int((current / total) * 100)
+                analysis_progress.progress(percent, text=f"🔍 Analyzing article {current}/{total}...")
 
             top_companies = extract_top_companies(
-                st.session_state.articles, 
+                st.session_state.articles,  # analyze ALL articles for accuracy
                 st.session_state.get('last_query', query),
                 top_n=5,
-                ner_model=ner_model
+                ner_model=ner_model,
+                progress_callback=update_analysis_progress  # <--- PASS CALLBACK
             )
+            
+            analysis_progress.empty() # Remove bar when done
             
             if top_companies:
                 # 2. Display Top 3 as Big Metrics + Total Articles on the right
@@ -285,8 +307,8 @@ if st.session_state.articles:
                     with cols[idx]:
                         st.metric(
                             label=f"#{idx+1} {company['name']}", 
-                            value=f"{company['dominance_score']:.1f}", 
-                            delta=f"{company['mentions']} mentions"
+                            value=f"{company['mentions']} mentions", 
+                            delta=None
                         )
                 
                 # Show Total Articles in the right-most column
@@ -305,14 +327,12 @@ if st.session_state.articles:
                     
                     # Select and rename columns for a cleaner table
                     display_df = df_companies[[
-                        'rank', 'name', 'mentions', 'articles', 'dominance_score', 'avg_involvement'
+                        'rank', 'name', 'mentions', 'articles'
                     ]].rename(columns={
                         'rank': 'Rank',
-                        'name': 'Entity Name',
+                        'name': 'Brand Name',
                         'mentions': 'Mentions',
-                        'articles': 'Articles',
-                        'dominance_score': 'Dominance Score',
-                        'avg_involvement': 'Avg. Involvement (%)'
+                        'articles': 'Articles Mentioned In'
                     })
                     
                     st.dataframe(
@@ -320,15 +340,9 @@ if st.session_state.articles:
                         hide_index=True, 
                         use_container_width=True,
                         column_config={
-                            "Dominance Score": st.column_config.ProgressColumn(
-                                "Dominance", 
-                                format="%.1f", 
-                                min_value=0, 
-                                max_value=100
-                            ),
-                            "Avg. Involvement (%)": st.column_config.NumberColumn(
-                                "Involvement",
-                                format="%.1f%%"
+                            "Mentions": st.column_config.NumberColumn(
+                                "Total Mentions",
+                                format="%d 📢"
                             )
                         }
                     )

@@ -111,60 +111,12 @@ class AdvancedNERExtractor:
         
         return True
     
-    def _calculate_involvement_score(self, entity: str, headline: str, position: int, total_words: int) -> float:
-        """
-        Determine if entity is MAIN ACTOR or incidental mention
-        Score: 0.0 (incidental) to 1.0 (main actor)
-        """
-        score = 0.0
-        entity_lower = entity.lower()
-        headline_lower = headline.lower()
-        
-        # Factor 1: Position in headline (30% weight)
-        # Main actors typically appear in first 40% of headline
-        position_ratio = position / max(total_words, 1)
-        if position_ratio <= 0.4:
-            score += 0.3
-        elif position_ratio <= 0.6:
-            score += 0.15
-        
-        # Factor 2: Headline structure (40% weight)
-        # Check if entity is the subject (before verb)
-        action_verbs = ['launches', 'announces', 'unveils', 'introduces',
-                       'acquires', 'partners', 'expands', 'raises', 'files', 'wins']
-        
-        # Find if entity appears before action verb
-        headline_words = headline_lower.split()
-        entity_words = entity_lower.split()
-        
-        for verb in action_verbs:
-            if verb in headline_words:
-                verb_pos = headline_words.index(verb)
-                # Check if entity is before verb
-                for ent_word in entity_words:
-                    if ent_word in headline_words:
-                        ent_pos = headline_words.index(ent_word)
-                        if ent_pos < verb_pos:
-                            score += 0.4
-                            break
-                break
-        
-        # Factor 3: Possessive or attribution (20% weight)
-        # "Company's product" = main actor
-        # "according to Company" = incidental
-        if f"{entity_lower}'s" in headline_lower or f"{entity_lower} said" in headline_lower:
-            score += 0.2
-        elif "according to" in headline_lower and entity_lower in headline_lower.split("according to")[1]:
-            score -= 0.2  # Penalize citations
-        
-        # Factor 4: Standalone mention (10% weight)
-        # Entity mentioned alone vs in a list
-        if headline_lower.count(entity_lower) == 1:
-            score += 0.1
-        
-        return min(max(score, 0.0), 1.0)
     
-    def extract_entities_ner(self, articles: List[Dict]) -> Dict[str, Dict]:
+    # Involvement scoring removed for simplicity as per user request
+    def _calculate_involvement_score(self, entity: str, headline: str, position: int, total_words: int) -> float:
+        return 1.0 # Default value since we only care about mentions now
+    
+    def extract_entities_ner(self, articles: List[Dict], progress_callback=None) -> Dict[str, Dict]:
         """
         Extract entities using NER with strict filtering
         Returns: {entity_name: {mentions, involvement_scores, headlines}}
@@ -177,43 +129,91 @@ class AdvancedNERExtractor:
             'sources': set()
         })
         
-        for article in articles:
+        total_articles = len(articles)
+        
+        for idx, article in enumerate(articles):
+            # Update progress
+            if progress_callback:
+                try:
+                    progress_callback(idx + 1, total_articles)
+                except:
+                    pass
+
             headline = article.get('title', '')
             source = article.get('source', 'Unknown')
             
-            if not headline or len(headline) < 10:
+            # --- ENHANCEMENT: Include Article Content ---
+            # We construct a "rich text" for analysis: Title + Summary + First 1000 chars of body
+            # This ensures we capture mentions even if they aren't in the headline
+            
+            full_text = article.get('full_text', '')
+            summary = article.get('summary', '')
+            
+            # Combine available text components
+            # Priority: Title > Summary > Body start
+            text_parts = [headline]
+            
+            if summary and len(summary) > 10:
+                text_parts.append(summary)
+            
+            # If full text is available and different from summary, add the rest
+            if full_text and len(full_text) > 50 and full_text != summary:
+                text_parts.append(full_text)
+                
+            combined_text = ". ".join(text_parts)
+            
+            if not combined_text or len(combined_text) < 10:
                 continue
             
+            # CHUNKING LOGIC FOR LONG ARTICLES
+            # We split the text into chunks of ~2000 characters to avoid model limits
+            # and ensure we catch entities throughout the entire article.
+            chunk_size = 2000
+            chunks = [combined_text[i:i+chunk_size] for i in range(0, len(combined_text), chunk_size)]
+            
             # Use NER or fallback to pattern-based
-            if self.ner:
-                entities = self._extract_with_transformers(headline)
-            else:
-                entities = self._extract_with_patterns(headline)
+            all_entities = []
+            for i, chunk in enumerate(chunks):
+                if self.ner:
+                    chunk_entities = self._extract_with_transformers(chunk)
+                else:
+                    chunk_entities = self._extract_with_patterns(chunk)
+                
+                # Adjust positions for chunks after the first one
+                offset = i * chunk_size
+                adjusted_entities = [(entity, pos + offset) for entity, pos in chunk_entities]
+                all_entities.extend(adjusted_entities)
             
-            headline_words = headline.split()
-            total_words = len(headline_words)
+            entities = all_entities
             
-            for entity, position in entities:
+            # Track article-level uniqueness for article_count
+            seen_in_article = set()
+            
+            for entity_text, position in entities:
                 # STRICT: Validate company/organization
-                if not self._is_valid_company_name(entity):
+                if not self._is_valid_company_name(entity_text):
                     continue
                 
-                # Calculate involvement score
-                involvement = self._calculate_involvement_score(
-                    entity, headline, position, total_words
-                )
+                # Normalization for keying
+                entity_key = entity_text
                 
-                # Only count if involvement > threshold (main actor)
-                # Lowered to 0.2 (20%) to capture more entities in smaller datasets
-                if involvement >= 0.2:
-                    entity_data[entity]['mentions'] += 1
-                    entity_data[entity]['involvement_scores'].append(involvement)
-                    entity_data[entity]['headlines'].append(headline)
-                    entity_data[entity]['sources'].add(source)
-        
-        # Calculate article count
-        for entity in entity_data:
-            entity_data[entity]['article_count'] = len(entity_data[entity]['headlines'])
+                # Calculate involvement score (simplified)
+                involvement = 1.0
+                
+                # Update stats
+                entity_data[entity_key]['mentions'] += 1
+                entity_data[entity_key]['involvement_scores'].append(involvement)
+                entity_data[entity_key]['headlines'].append(headline)
+                
+                # Only add headline if not already there to save memory
+                if headline not in entity_data[entity_key]['headlines']:
+                    entity_data[entity_key]['headlines'].append(headline)
+                entity_data[entity_key]['sources'].add(source)
+
+                # Increment article_count only once per entity per article
+                if entity_key not in seen_in_article:
+                    entity_data[entity_key]['article_count'] += 1
+                    seen_in_article.add(entity_key)
         
         return dict(entity_data)
     
@@ -267,61 +267,31 @@ class AdvancedNERExtractor:
     
     def rank_by_dominance(self, entity_data: Dict[str, Dict], total_articles: int) -> List[Dict]:
         """
-        Rank entities by DOMINANCE, not just frequency
+        Rank entities purely by MENTION COUNT (Frequency).
+        Simple logic: More mentions = Higher rank.
         """
         ranked = []
         
         for entity, data in entity_data.items():
             mentions = data['mentions']
             article_count = data['article_count']
-            involvement_scores = data['involvement_scores']
-            source_count = len(data['sources'])
             
-            # NOISE REMOVAL: Minimum thresholds (adjusted for smaller datasets)
-            # If very few articles (<10), allow single mentions. Otherwise require 2+
-            min_mentions = 1 if total_articles < 10 else 2
-            
-            if mentions < min_mentions:
+            # NOISE REMOVAL: Minimum threshold
+            # If very few mentions, ignore unless it's a tiny dataset
+            if mentions < 2 and total_articles > 10:
                 continue
-            
-            coverage_ratio = article_count / max(total_articles, 1)
-            # Dynamic threshold: 1% for large datasets, 0.5% for smaller ones
-            min_coverage = 0.005 if total_articles > 100 else 0.003
-            if coverage_ratio < min_coverage:
-                continue
-            
-            # DOMINANCE SCORE CALCULATION
-            # Factor 1: Coverage (30%)
-            coverage_score = min(coverage_ratio * 100, 30)
-            
-            # Factor 2: Average involvement (40%)
-            avg_involvement = sum(involvement_scores) / len(involvement_scores)
-            involvement_score = avg_involvement * 40
-            
-            # Factor 3: Source diversity (20%)
-            diversity_score = min(source_count / 10, 1.0) * 20
-            
-            # Factor 4: Consistency (10%)
-            # Mentions per article (higher = more consistent)
-            consistency = mentions / max(article_count, 1)
-            consistency_score = min(consistency / 3, 1.0) * 10
-            
-            # Total dominance score
-            dominance_score = coverage_score + involvement_score + diversity_score + consistency_score
             
             ranked.append({
                 'name': entity,
                 'mentions': mentions,
                 'articles': article_count,
-                'coverage_pct': round(coverage_ratio * 100, 2),
-                'avg_involvement': round(avg_involvement * 100, 1),
-                'sources': source_count,
-                'dominance_score': round(dominance_score, 2),
+                # 'dominance_score' kept for compatibility but equals mentions
+                'dominance_score': mentions, 
                 'entity_type': 'company'
             })
         
-        # Sort by dominance score (descending)
-        ranked.sort(key=lambda x: x['dominance_score'], reverse=True)
+        # Sort by mentions (descending)
+        ranked.sort(key=lambda x: x['mentions'], reverse=True)
         
         # Add ranks
         for i, item in enumerate(ranked, 1):
@@ -330,7 +300,7 @@ class AdvancedNERExtractor:
         return ranked
 
 
-def extract_top_companies(articles: List[Dict], query: str, top_n: int = 10, ner_model=None) -> List[Dict]:
+def extract_top_companies(articles: List[Dict], query: str, top_n: int = 10, ner_model=None, progress_callback=None) -> List[Dict]:
     """
     Main function: Extract top trending companies/organizations
     
@@ -339,6 +309,7 @@ def extract_top_companies(articles: List[Dict], query: str, top_n: int = 10, ner
         query: Search query (for context)
         top_n: Number of top entities to return
         ner_model: Optional pre-loaded NER pipeline
+        progress_callback: Optional function(current, total)
     
     Returns:
         List of top N companies ranked by dominance
@@ -349,10 +320,16 @@ def extract_top_companies(articles: List[Dict], query: str, top_n: int = 10, ner
     extractor = AdvancedNERExtractor(ner_instance=ner_model)
     
     # Step 1: Extract entities with NER
-    entity_data = extractor.extract_entities_ner(articles)
+    entity_data = extractor.extract_entities_ner(articles, progress_callback=progress_callback)
     
-    # Step 2: Rank by dominance
-    ranked = extractor.rank_by_dominance(entity_data, len(articles))
+    # Step 2: Rank them
+    ranked_entities = extractor.rank_by_dominance(entity_data, len(articles))
     
-    # Step 3: Return top N
-    return ranked[:top_n]
+    # Step 3: Filter out the query itself (if it appears)
+    # e.g. if searching for "NVIDIA", we don't want NVIDIA to be #1 result usually, 
+    # or maybe we do? Let's keep it but maybe flag it? 
+    # Usually users want to see *related* entities.
+    # For now, we return everything.
+    
+    return ranked_entities[:top_n]
+

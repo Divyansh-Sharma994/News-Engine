@@ -10,7 +10,29 @@ from bs4 import BeautifulSoup
 import re
 import json
 import random
+import ssl
+import requests 
 from urllib.parse import urlparse, parse_qs
+from aiohttp_socks import ProxyConnector
+from aiohttp import DummyCookieJar, TCPConnector, ClientResponseError
+try:
+    from gdelt_fetcher import renew_tor_identity, TorManager
+except ImportError:
+    # Failsafe if imported in a way that doesn't allow direct import
+    class TorManager:
+        @classmethod
+        async def renew_identity(cls): renew_tor_identity()
+        @classmethod
+        async def wait_if_cooldown(cls): pass
+
+# --- AIOHTTP LIMIT HACK ---
+# Yahoo Finance sends massive headers. aiohttp defaults to 8190 bytes.
+# We must increase this globally to avoid "Header value is too long" errors.
+# We access the internal http_parser to change defaults.
+from aiohttp import http_parser
+http_parser.MAX_LINE_SIZE = 65536
+http_parser.MAX_FIELD_SIZE = 65536
+http_parser.MAX_HEADERS = 65536
 
 # --- GOOGLE NEWS DECODER ---
 # What is this?
@@ -83,18 +105,23 @@ async def decode_google_news_url(session, url):
         
         return real_url
 
-    except Exception:
+    except Exception as e:
         # If anything goes wrong, just return the original URL and hope for the best.
+        print(f"⚠️ Failed to decode Google News URL: {e}")
         return url
 
 
 # This function goes to a single website link and reads the FULL text.
-async def scrape_article_content_async(session, url):
+async def scrape_article_content_async(session, url, use_tor=False):
     """
     Go to a website and read the entire article.
     Also checks if the article requires a subscription.
     """
     try:
+        # Wait if another worker is rotating Tor
+        if use_tor:
+            await TorManager.wait_if_cooldown()
+
         # STEP 1: If it's a Google link, decode it first!
         if "news.google.com" in url:
             decoded_url = await decode_google_news_url(session, url)
@@ -118,9 +145,17 @@ async def scrape_article_content_async(session, url):
             'Referer': 'https://news.google.com/', # We say "Google sent us!"
         }
         
+        if use_tor:
+            headers['Connection'] = 'close'
+        
         # STEP 2: Download the page
         # We wait up to 30 seconds.
         async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=30), allow_redirects=True) as response:
+            if response.status in [429, 503] and use_tor:
+                print(f"⚠️ Rate limited on {url}. Triggering Global Tor Rotation...")
+                await TorManager.renew_identity()
+                # We don't retry here to keep it simple
+            
             if response.status != 200:
                 # 401/403 means "Access Denied" (Paywall)
                 if response.status in [401, 403]:
@@ -145,18 +180,32 @@ async def scrape_article_content_async(session, url):
                     is_paywall = True
                     break
             
-            # --- CLEANING THE PAGE ---
+            # --- CLEANING THE PAGE (Aggressive) ---
             # Remove ads, menus, popups, and other junk.
-            for noise in soup(["script", "style", "nav", "header", "footer", "aside", "form", "iframe", "button", "ads", "noscript", "svg"]):
+            # We add more specific junk tags and classes.
+            for noise in soup(["script", "style", "nav", "header", "footer", "aside", "form", "iframe", "button", "input", "textarea", "select", "option", "ads", "noscript", "svg", "figure", "figcaption"]):
                 noise.decompose()
+
+            # Remove elements with "bad" class/id names
+            # This is a heuristic to kill sidebars, popups, and sticky headers that survive tag cleaning
+            bad_patterns = re.compile(r"ad-|ads|promo|subscribe|popup|cookie|menu|sidebar|social|share|comment|newsletter|related", re.IGNORECASE)
+            for tag in soup.find_all(attrs={"class": bad_patterns}) + soup.find_all(attrs={"id": bad_patterns}):
+                tag.decompose()
             
             # --- FINDING THE ARTICLE TEXT (Smart Logic) ---
             # 1. Try to find the <article> tag (Standard HTML5)
             article_tag = soup.find('article')
+            
+            # 2. Try to find common "main content" divs
+            content_div = soup.find('div', class_=re.compile(r"content|body|article|story|main", re.IGNORECASE))
+            
+            target = None
             if article_tag:
-                 target = article_tag
+                target = article_tag
+            elif content_div:
+                target = content_div
             else:
-                 # 2. Heuristic: Find the element with the most paragraph text
+                 # 3. Last Resort Heuristic: Find the element with the most paragraph text
                  # We look for parents of <p> tags and see which one contains the most text.
                  parents = {}
                  for p in soup.find_all('p'):
@@ -181,7 +230,9 @@ async def scrape_article_content_async(session, url):
             for p in target.find_all(['p', 'h2', 'h3', 'li']):
                 # Simple filter: don't include copyright footers or tiny text
                 text = p.get_text(separator=' ', strip=True)
-                if len(text) > 30 and "copyright" not in text.lower():
+                
+                # Stronger filter for "Read more", "Click here", etc.
+                if len(text) > 30 and "copyright" not in text.lower() and "all rights reserved" not in text.lower():
                     paragraphs.append(text)
             
             # Join them
@@ -195,6 +246,7 @@ async def scrape_article_content_async(session, url):
                 if len(all_text) > 200 and len(all_text) < 50000:
                      full_text = all_text
 
+            # Clean up massive whitespace blocks
             full_text = re.sub(r'\n{3,}', '\n\n', full_text)
             
             # Create a short summary (first 3 paragraphs)
@@ -213,12 +265,70 @@ async def scrape_article_content_async(session, url):
                 "is_paywall": is_paywall
             }
     
-    except Exception:
+    except Exception as e:
+        # Fallback for "Header value is too long" (common with Yahoo)
+        # aiohttp fails, so we try 'requests' (synchronous) in a thread
+        if "Header value is too long" in str(e) or "Got more than" in str(e):
+            try:
+                # Run sync requests in thread
+                loop = asyncio.get_event_loop()
+                def fetch_sync():
+                    return requests.get(url, headers=headers, timeout=30, verify=False)
+                
+                response = await loop.run_in_executor(None, fetch_sync)
+                
+                if response.status_code == 200:
+                    html = response.text
+                    soup = BeautifulSoup(html, 'lxml')
+                    
+                    # --- PAYWALL DETECTION (Duplicate logic) ---
+                    paywall_keywords = [
+                        "subscription required", "subscribe now", "already a subscriber", 
+                        "log in to continue", "read the full article", "premium content", 
+                        "register to continue", "you have reached your limit"
+                    ]
+                    text_lower = soup.get_text().lower()
+                    is_paywall = False
+                    for keyword in paywall_keywords:
+                        if keyword in text_lower[:1000]: 
+                            is_paywall = True
+                            break
+                    
+                    # --- CLEANING THE PAGE (Aggressive) ---
+                    for noise in soup(["script", "style", "nav", "header", "footer", "aside", "form", "iframe", "button", "input", "textarea", "select", "option", "ads", "noscript", "svg", "figure", "figcaption"]):
+                        noise.decompose()
+                    
+                    bad_patterns = re.compile(r"ad-|ads|promo|subscribe|popup|cookie|menu|sidebar|social|share|comment|newsletter|related", re.IGNORECASE)
+                    for tag in soup.find_all(attrs={"class": bad_patterns}) + soup.find_all(attrs={"id": bad_patterns}):
+                        tag.decompose()
+                    
+                    # --- FINDING THE ARTICLE TEXT (Simple Fallback) ---
+                    paragraphs = []
+                    for p in soup.find_all(['p', 'h2', 'h3']):
+                        text = p.get_text(separator=' ', strip=True)
+                        if len(text) > 30:
+                            paragraphs.append(text)
+                    
+                    full_text = '\n\n'.join(paragraphs[:500]) # Limit to avoid huge processing
+                    if not full_text:
+                        full_text = soup.get_text(separator='\n\n', strip=True)[:5000]
+                        
+                    summary = full_text[:400] + "..." if len(full_text) > 400 else full_text
+                    
+                    return {
+                        "full_text": full_text,
+                        "summary": summary,
+                        "is_paywall": is_paywall
+                    }
+            except Exception as e2:
+                 print(f"⚠️ Requests fallback failed for {url}: {e2}")
+
         # If scraping fails, we ignore it safely.
+        print(f"⚠️ Scraping failed for {url}: {e}")
         return None
 
 # This function updates our list of articles with the detailed info
-async def enhance_articles_async(articles, limit=None, progress_callback=None):
+async def enhance_articles_async(articles, limit=None, progress_callback=None, use_tor=False):
     """
     Process articles to get full content.
     This runs 'scrape_article_content_async' for MANY articles at once.
@@ -236,12 +346,16 @@ async def enhance_articles_async(articles, limit=None, progress_callback=None):
     total = len(targets)
     completed = 0
     
-    jar = aiohttp.CookieJar(unsafe=True)
-    semaphore = asyncio.Semaphore(20)
+    # Use DummyCookieJar to discard cookies (prevents "Header value too long" errors from Yahoo)
+    jar = DummyCookieJar()
+    
+    # Reduced concurrency for Tor mode to avoid circuit overload
+    concurrency = 5 if use_tor else 20
+    semaphore = asyncio.Semaphore(concurrency)
 
     async def sem_scrape(session, url):
         async with semaphore:
-            result = await scrape_article_content_async(session, url)
+            result = await scrape_article_content_async(session, url, use_tor=use_tor)
             
             nonlocal completed
             completed += 1
@@ -252,7 +366,28 @@ async def enhance_articles_async(articles, limit=None, progress_callback=None):
                     pass
             return result
 
-    async with aiohttp.ClientSession(cookie_jar=jar) as session:
+    # OMEGA TOR CONNECTOR PROVIDER
+    def get_connector():
+        # Create unverified SSL context
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+
+        if use_tor:
+            # Pass ssl context to ProxyConnector if supported, otherwise let it be
+            # aiohttp_socks typically handles this via the `ssl` param in request or connector
+            # For ProxyConnector, we often pass it to the ClientSession or the connector constructor
+            return ProxyConnector.from_url("socks5://127.0.0.1:9150", ssl=ssl_context)
+        
+        # Standard TCP connector without SSL verification
+        return TCPConnector(ssl=False)
+
+    # We use a context manager to ensure the session is closed, 
+    # but we might need to recreate it if Tor rotates.
+    # However, for simplicity, we'll keep one session per enhancement run
+    # and let individual scrapes wait for cooldown.
+    connector = get_connector()
+    async with aiohttp.ClientSession(cookie_jar=jar, connector=connector) as session:
         tasks = []
         for article in targets:
             tasks.append(sem_scrape(session, article['link']))
